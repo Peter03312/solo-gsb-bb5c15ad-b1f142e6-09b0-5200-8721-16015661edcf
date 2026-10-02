@@ -120,8 +120,42 @@
       <div id="res-conflict"></div>
       <h3>预约列表</h3>
       <div id="res-list"></div>
-      <h3>占用日程（按当前可选数量判定，超限区段标记「不足」）</h3>
+      <h3>占用日程（按当前库存判定；停用与「占用+停用」不足分区段展示）</h3>
       <div id="res-schedule"></div>
+    </section>
+
+    <section class="card" id="sec-suspend">
+      <h2>8. 配重块临时停用</h2>
+      <div class="muted" style="margin-bottom:10px">
+        按质量规格登记停用数量、原因与 UTC 起止时间，时段按
+        <b>左闭右开 [开始, 结束)</b> 计算；同规格重叠停用量累加，任一时刻不得超过登记时
+        该规格的当前库存。停用<b>立即影响新预约</b>：预约时同时核对库存、生效停用与已有预约，
+        占用加停用超库存则整单拒绝。停用可与既有预约重叠，既有预约不改写。
+        仅未开始的停用可撤销，撤销留历史并释放后续容量。
+      </div>
+      <div class="form-row">
+        <label>质量规格（g，须为当前录入规格）
+          <select id="sus-mass"></select>
+        </label>
+        <label>停用数量
+          <input id="sus-qty" type="number" min="1" step="1" />
+        </label>
+        <label>原因
+          <input id="sus-reason" type="text" placeholder="如：送检校准 / 损坏待修" />
+        </label>
+        <label>开始时间（UTC）
+          <input id="sus-start" type="datetime-local" step="60" />
+        </label>
+        <label>结束时间（UTC）
+          <input id="sus-end" type="datetime-local" step="60" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="sus-submit" class="primary">登记停用</button>
+      </div>
+      <div id="sus-conflict"></div>
+      <h3>停用记录（含已撤销历史）</h3>
+      <div id="sus-list"></div>
     </section>
   </main>
 

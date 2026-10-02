@@ -82,6 +82,7 @@ function renderAll() {
   renderPublications();
   renderVerifications();
   renderReservations();
+  renderSuspensions();
 }
 
 function renderHoleMax(d) {
@@ -780,7 +781,7 @@ async function loadSchedule() {
   const sch = await api('GET', '/api/schedule');
   const box = $('#res-schedule');
   if (!sch.specs || sch.specs.length === 0) {
-    box.innerHTML = '<div class="muted">当前无生效中的预约占用。</div>';
+    box.innerHTML = '<div class="muted">当前无生效中的预约占用或停用。</div>';
     return;
   }
   box.innerHTML = sch.specs
@@ -788,27 +789,35 @@ async function loadSchedule() {
       (s) => `<div class="spec-block">
       <div class="spec-head">
         <b>规格 ${s.mass} g</b>
-        <span class="muted">当前可选 ${s.capacity} 枚 · 时段内峰值占用 ${s.peak} 枚</span>
+        <span class="muted">当前库存 ${s.capacity} 枚 · 时段内峰值占用 ${s.peak} 枚 ·
+          峰值停用 ${s.peakSuspended || 0} 枚 · 占用+停用峰值 ${s.peakCombined || s.peak} 枚</span>
         <span class="badge ${s.shortage ? 'bad' : 'ok'}">${
-          s.shortage ? '✗ 存在不足区段' : '✓ 数量充足'
+          s.shortage ? '✗ 占用超库存' : '✓ 占用未超库存'
+        }</span>
+        <span class="badge ${s.combinedShortage ? 'bad' : 'ok'}">${
+          s.combinedShortage ? '✗ 占用+停用存在不足区段' : '✓ 占用+停用充足'
         }</span>
       </div>
       ${
-        s.segments.length
+        s.combinedSegments && s.combinedSegments.length
           ? `<table class="pair-list">
-        <thead><tr><th>时段（UTC）</th><th>占用量</th><th>判定</th></tr></thead>
-        <tbody>${s.segments
+        <thead><tr><th>时段（UTC）</th><th>预约占用</th><th>停用</th><th>占用判定</th><th>占用+停用判定</th></tr></thead>
+        <tbody>${s.combinedSegments
           .map(
             (g) => `<tr${g.shortage ? ' class="row-bad"' : ''}>
             <td class="mono">${g.start} 至 ${g.end}</td>
-            <td>${g.used} / ${s.capacity} 枚</td>
+            <td>${g.used} 枚</td>
+            <td>${g.suspended || 0} 枚</td>
+            <td class="${g.used > s.capacity ? 'tag-bad' : 'tag-ok'}">${
+              g.used > s.capacity ? '✗ 不足' : '✓'
+            }</td>
             <td class="${g.shortage ? 'tag-bad' : 'tag-ok'}">${
               g.shortage ? '✗ 不足' : '✓'
             }</td>
           </tr>`,
           )
           .join('')}</tbody></table>`
-          : '<div class="muted">该时段内无占用。</div>'
+          : '<div class="muted">该时段内无占用或停用。</div>'
       }
     </div>`,
     )
@@ -865,6 +874,109 @@ async function cancelReservation(id) {
   try {
     await api('POST', `/api/reservations/${id}/cancel`);
     await refresh(`预约 #${id} 已取消（历史保留，占用已释放）。`);
+  } catch (e) {
+    showAlert(e.message, 'err');
+  }
+}
+
+// ---------- 配重块临时停用 ----------
+
+const SUS_PHASE_LABEL = {
+  notStarted: '未开始',
+  ongoing: '生效中',
+  ended: '已结束',
+  revoked: '已撤销',
+};
+
+function renderSuspensions() {
+  // 规格下拉：仅当前录入规格
+  const sel = $('#sus-mass');
+  const weights = (state.data && state.data.weights) || [];
+  const prev = sel.value;
+  sel.innerHTML = weights.length
+    ? weights
+        .map((w) => `<option value="${w.mass}">${fmt(w.mass)} g（库存 ${w.quantity} 枚）</option>`)
+        .join('')
+    : '<option value="">（请先在第 3 节录入配重规格）</option>';
+  if (weights.some((w) => String(w.mass) === prev)) sel.value = prev;
+
+  const box = $('#sus-list');
+  const list = state.suspensions || [];
+  if (list.length === 0) {
+    box.innerHTML = '<div class="muted">暂无停用记录。</div>';
+    return;
+  }
+  box.innerHTML = `<div class="table-wrap"><table class="res-table">
+    <thead><tr>
+      <th>规格</th><th>停用数量</th><th>原因</th><th>时段（UTC，左闭右开）</th>
+      <th>状态</th><th></th>
+    </tr></thead><tbody>${list
+      .map(
+        (sp) => `<tr${sp.status === 'revoked' ? ' class="row-stale"' : ''}>
+      <td><b>${fmt(sp.mass)} g</b></td>
+      <td>${sp.quantity} 枚</td>
+      <td>${escapeHtml(sp.reason)}</td>
+      <td class="mono">${sp.startUtc}<br>至 ${sp.endUtc}</td>
+      <td><span class="badge ${
+        sp.status === 'revoked' ? 'stale' : sp.phase === 'ongoing' ? 'bad' : 'ok'
+      }">${SUS_PHASE_LABEL[sp.phase]}</span></td>
+      <td>${
+        sp.revocable
+          ? `<button data-sus-revoke="${sp.id}" class="danger">撤销停用</button>`
+          : ''
+      }</td>
+    </tr>`,
+      )
+      .join('')}</tbody></table></div>`;
+  box.querySelectorAll('[data-sus-revoke]').forEach((b) =>
+    b.addEventListener('click', () => revokeSuspension(Number(b.dataset.susRevoke))),
+  );
+}
+
+$('#sus-submit').addEventListener('click', async () => {
+  const mass = Number($('#sus-mass').value);
+  const quantity = Number($('#sus-qty').value);
+  const reason = $('#sus-reason').value.trim();
+  const startUtc = $('#sus-start').value || '';
+  const endUtc = $('#sus-end').value || '';
+  $('#sus-conflict').innerHTML = '';
+  try {
+    const r = await api('POST', '/api/suspensions', {
+      mass,
+      quantity,
+      reason,
+      startUtc,
+      endUtc,
+    });
+    $('#sus-qty').value = '';
+    $('#sus-reason').value = '';
+    await refresh(
+      `停用已登记：${fmt(r.mass)} g × ${r.quantity}（${r.startUtc} 至 ${r.endUtc}）。`,
+    );
+  } catch (e) {
+    const conflicts = e.data && e.data.detail && e.data.detail.conflicts;
+    if (e.status === 409 && conflicts) {
+      $('#sus-conflict').innerHTML = `<div class="banner bad">
+        <b>停用量超出当前库存，停用未登记：</b>
+        <ul>${conflicts
+          .map(
+            (c) =>
+              `<li>规格 ${c.mass} g：本次停用 ${c.required} 枚，当前库存 ${c.capacity} 枚；` +
+              `冲突时段：${c.windows
+                .map((w) => `${w.start} 至 ${w.end}（已停用 ${w.suspended} 枚）`)
+                .join('；')}</li>`,
+          )
+          .join('')}</ul>
+      </div>`;
+    }
+    showAlert(e.message, 'err');
+  }
+});
+
+async function revokeSuspension(id) {
+  try {
+    await api('POST', `/api/suspensions/${id}/revoke`);
+    await refresh(`停用 #${id} 已撤销（历史保留，后续容量已释放）。`);
   } catch (e) {
     showAlert(e.message, 'err');
   }

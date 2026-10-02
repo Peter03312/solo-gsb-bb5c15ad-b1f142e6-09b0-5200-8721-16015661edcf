@@ -27,6 +27,12 @@ import {
   listActiveReservations,
   insertReservation,
   cancelReservation,
+  listSuspensionRows,
+  getSuspensionRow,
+  listOverlappingActiveSuspensions,
+  listActiveSuspensions,
+  insertSuspension,
+  revokeSuspension,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -35,6 +41,7 @@ import {
   toIso,
   planUsage,
   checkCapacity,
+  checkSuspension,
   buildSchedule,
 } from './reserve.js';
 import {
@@ -77,6 +84,7 @@ export function createApp(db) {
       reservations: listReservationRows(db).map((r) =>
         reservationView(r, hash, Date.now()),
       ),
+      suspensions: listSuspensionRows(db).map((r) => suspensionView(r, Date.now())),
     });
   });
 
@@ -340,14 +348,32 @@ export function createApp(db) {
             usage: JSON.parse(r.usage_json),
           }),
         );
-        const check = checkCapacity({ usage, capacityOf, overlapping, startMs, endMs });
+        // 同时核对当前库存、重叠的生效停用：占用 + 停用任一时刻不得超过当前数量。
+        // 停用允许与既有预约重叠，既有预约不因此改写。
+        const suspOverlap = listOverlappingActiveSuspensions(db, startUtc, endUtc).map(
+          (sp) => ({
+            startMs: Date.parse(sp.start_utc),
+            endMs: Date.parse(sp.end_utc),
+            mass: sp.mass,
+            count: sp.quantity,
+          }),
+        );
+        const check = checkCapacity({
+          usage,
+          capacityOf,
+          overlapping,
+          suspensions: suspOverlap,
+          startMs,
+          endMs,
+        });
         if (!check.ok) {
-          const errs = ['当前可选数量不足，预约未产生任何占用：'];
+          const errs = ['当前可用数量不足（预约占用 + 生效停用超出当前库存），预约未产生任何占用：'];
           for (const c of check.conflicts) {
             for (const w of c.windows) {
               errs.push(
-                `规格 ${c.mass} g：${w.start} 至 ${w.end} 已占用 ${w.used} 枚，` +
-                  `本次需 ${c.required} 枚，超出当前可选数量 ${c.capacity} 枚`,
+                `规格 ${c.mass} g：${w.start} 至 ${w.end} 已预约占用 ${w.used} 枚、` +
+                  `临时停用 ${w.suspended} 枚，本次需 ${c.required} 枚，` +
+                  `合计超出当前库存 ${c.capacity} 枚`,
               );
             }
           }
@@ -411,14 +437,22 @@ export function createApp(db) {
     }
   });
 
-  // 预约日程：各质量规格在 [from, to) 内的分段占用与「不足」区段
-  // （占用超过当前录入数量即标记不足；既有预约不因数量减少/图失效被改写）
+  // 预约日程：各质量规格在 [from, to) 内的分段占用/停用与「不足」区段。
+  // segments.shortage 仅表示预约占用超过当前录入数量（字段含义不变）；
+  // 另展示停用量（suspendedSegments）与「占用+停用」合计不足区段（combinedSegments）。
+  // 既有预约/停用不因数量减少或图失效被改写。
   app.get('/api/schedule', (req, res, next) => {
     try {
       const active = listActiveReservations(db).map((r) => ({
         startMs: Date.parse(r.start_utc),
         endMs: Date.parse(r.end_utc),
         usage: JSON.parse(r.usage_json),
+      }));
+      const suspensions = listActiveSuspensions(db).map((sp) => ({
+        startMs: Date.parse(sp.start_utc),
+        endMs: Date.parse(sp.end_utc),
+        mass: sp.mass,
+        count: sp.quantity,
       }));
       const fromMs = parseUtcMs(req.query.from);
       const toMs = parseUtcMs(req.query.to);
@@ -428,20 +462,24 @@ export function createApp(db) {
       if (req.query.to !== undefined && toMs === null) {
         throw new ValidationError(['to 不是合法的 UTC 时间（ISO 8601）']);
       }
+      const horizon = [
+        ...active.map((r) => [r.startMs, r.endMs]),
+        ...suspensions.map((sp) => [sp.startMs, sp.endMs]),
+      ];
       const from =
         fromMs !== null
           ? fromMs
-          : active.length
-            ? Math.min(...active.map((r) => r.startMs))
+          : horizon.length
+            ? Math.min(...horizon.map(([a]) => a))
             : Date.now();
       const to =
         toMs !== null
           ? toMs
-          : active.length
-            ? Math.max(...active.map((r) => r.endMs))
+          : horizon.length
+            ? Math.max(...horizon.map(([, b]) => b))
             : from;
       if (!(from < to)) {
-        if (from === to && active.length === 0) {
+        if (from === to && horizon.length === 0) {
           return res.json({ from: toIso(from), to: toIso(to), specs: [] });
         }
         throw new ValidationError(['from 必须早于 to（时段按左闭右开 [from, to) 计算）']);
@@ -454,14 +492,176 @@ export function createApp(db) {
       const massSet = new Set();
       if (data) for (const w of data.weights) massSet.add(w.mass);
       for (const r of active) for (const u of r.usage) massSet.add(u.mass);
+      for (const sp of suspensions) massSet.add(sp.mass);
       const specs = buildSchedule({
         reservations: active,
+        suspensions,
         masses: [...massSet].sort((a, b) => a - b),
         capacityOf,
         fromMs: from,
         toMs: to,
       });
       res.json({ from: toIso(from), to: toIso(to), specs });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ---------- 配重块临时停用 ----------
+  //
+  // 按质量规格登记停用数量、原因与 UTC 起止时间（左闭右开 [start, end)）。
+  // 同规格重叠停用量累加；登记在单个事务内重读当前库存与重叠的生效停用，
+  // 任一时刻停用量不得超过登记时该规格当前数量（停用可与既有预约重叠，
+  // 既有预约不改写）。登记后即影响新预约：预约事务同时核对库存、停用与已有预约。
+  // 仅未开始的停用可撤销，撤销留历史且释放后续容量。
+
+  function suspensionView(row, nowMs) {
+    const startMs = Date.parse(row.start_utc);
+    const endMs = Date.parse(row.end_utc);
+    const phase =
+      row.status === 'revoked'
+        ? 'revoked'
+        : nowMs < startMs
+          ? 'notStarted'
+          : nowMs < endMs
+            ? 'ongoing'
+            : 'ended';
+    return {
+      id: row.id,
+      mass: row.mass,
+      quantity: row.quantity,
+      reason: row.reason,
+      startUtc: row.start_utc,
+      endUtc: row.end_utc,
+      status: row.status,
+      phase,
+      revocable: row.status === 'active' && nowMs < startMs,
+      createdAt: row.created_at,
+      revokedAt: row.revoked_at,
+    };
+  }
+
+  // 登记停用：非法时间/数量/未知规格 → 400；超量停用 → 409（附冲突规格与时段），
+  // 任何失败均在事务内回滚，不留下记录。
+  app.post('/api/suspensions', (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const errors = [];
+
+      const mass = body.mass;
+      if (typeof mass !== 'number' || !Number.isFinite(mass) || mass <= 0) {
+        errors.push('mass 必须是有限正数（配重块质量规格，单位 g）');
+      }
+      const quantity = body.quantity;
+      if (!Number.isInteger(quantity) || quantity <= 0) {
+        errors.push('停用数量必须是正整数');
+      }
+      const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+      if (!reason) errors.push('停用原因不能为空');
+      else if (reason.length > 200) errors.push('停用原因过长（最多 200 字符）');
+
+      const startMs = parseUtcMs(body.startUtc);
+      const endMs = parseUtcMs(body.endUtc);
+      if (startMs === null) errors.push('开始时间不是合法的 UTC 时间（ISO 8601）');
+      if (endMs === null) errors.push('结束时间不是合法的 UTC 时间（ISO 8601）');
+      if (startMs !== null && endMs !== null && !(startMs < endMs)) {
+        errors.push('开始时间必须早于结束时间（时段按左闭右开 [start, end) 计算）');
+      }
+      if (errors.length) throw new ValidationError(errors);
+
+      const startUtc = toIso(startMs);
+      const endUtc = toIso(endMs);
+
+      let view;
+      const tx = db.transaction(() => {
+        // 原子重读：当前库存（未知规格按当前录入判定）与重叠的生效停用
+        const data = loadData(db);
+        const spec = data && data.weights.find((w) => w.mass === mass);
+        if (!spec) {
+          throw new ValidationError([
+            `未知质量规格 ${mass} g：当前配重块录入中不存在该规格，不能登记停用`,
+          ]);
+        }
+        const overlapping = listOverlappingActiveSuspensions(db, startUtc, endUtc).map(
+          (sp) => ({
+            startMs: Date.parse(sp.start_utc),
+            endMs: Date.parse(sp.end_utc),
+            mass: sp.mass,
+            count: sp.quantity,
+          }),
+        );
+        const result = checkSuspension({
+          mass,
+          quantity,
+          capacity: spec.quantity,
+          overlapping,
+          startMs,
+          endMs,
+        });
+        if (!result.ok) {
+          const c = result.conflict;
+          const errs = ['停用量超出该规格当前数量，停用未登记：'];
+          for (const w of c.windows) {
+            errs.push(
+              `规格 ${c.mass} g：${w.start} 至 ${w.end} 已停用 ${w.suspended} 枚，` +
+                `本次再停用 ${c.required} 枚，超出当前库存 ${c.capacity} 枚`,
+            );
+          }
+          throw new ConflictError(errs, { detail: { conflicts: [c] } });
+        }
+        const row = insertSuspension(db, {
+          mass,
+          quantity,
+          reason,
+          startUtc,
+          endUtc,
+        });
+        view = suspensionView(row, Date.now());
+      });
+      tx();
+      res.status(201).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/suspensions', (req, res) => {
+    const nowMs = Date.now();
+    res.json(listSuspensionRows(db).map((r) => suspensionView(r, nowMs)));
+  });
+
+  app.get('/api/suspensions/:id', (req, res) => {
+    const row = getSuspensionRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '停用记录不存在' });
+    res.json(suspensionView(row, Date.now()));
+  });
+
+  // 撤销：仅未开始的生效停用可撤销；已撤销幂等返回原记录（历史保留）；
+  // 已开始/已结束 409。撤销立即释放后续容量（新预约可见）。
+  app.post('/api/suspensions/:id/revoke', (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const existed = getSuspensionRow(db, id);
+      if (!existed) return res.status(404).json({ error: '停用记录不存在' });
+      let view;
+      const tx = db.transaction(() => {
+        const row = getSuspensionRow(db, id);
+        if (row.status === 'revoked') {
+          view = suspensionView(row, Date.now());
+          return;
+        }
+        const nowMs = Date.now();
+        if (nowMs >= Date.parse(row.start_utc)) {
+          throw new ConflictError([
+            `停用 #${id} 已开始（${row.start_utc}），仅未开始的停用可撤销`,
+          ]);
+        }
+        const updated = revokeSuspension(db, id, toIso(nowMs));
+        if (!updated) throw new ConflictError([`停用 #${id} 状态已变化，请刷新后重试`]);
+        view = suspensionView(updated, nowMs);
+      });
+      tx();
+      res.json(view);
     } catch (e) {
       next(e);
     }

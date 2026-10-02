@@ -80,6 +80,22 @@ CREATE TABLE IF NOT EXISTS reservations (
   FOREIGN KEY (publication_id) REFERENCES publications(id)
 );
 
+-- 配重块临时停用：按质量规格记录停用数量、原因与 UTC 起止时间（左闭右开）。
+-- 登记时已核对「任一时刻同规格重叠停用量 + 本数量不超过当时登记数量」，
+-- 之后录入数量变化不改写既有停用；撤销仅置 status/revoked_at，历史保留。
+-- mass 不设外键（规格允许从录入中删除，历史停用与历史预约一样保留）。
+CREATE TABLE IF NOT EXISTS suspensions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mass REAL NOT NULL,
+  quantity INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  revoked_at TEXT
+);
+
 -- 现场装载核验：一条发布记录至多一份（草稿或完成），UNIQUE 约束兜底。
 -- version 为乐观锁：每次暂存自增，更新须携带旧版本以防覆盖他人修改。
 -- 完成后 completed_at 置位、result_json 冻结，之后草稿与完成结果均不可改写。
@@ -344,6 +360,54 @@ export function cancelReservation(db, id, nowIso) {
     )
     .run(nowIso, id, nowIso);
   return info.changes === 1 ? getReservationRow(db, id) : null;
+}
+
+// ---------- 配重块临时停用（由 server 在单事务内调用） ----------
+
+export function listSuspensionRows(db) {
+  return db
+    .prepare(`SELECT * FROM suspensions ORDER BY start_utc, id`)
+    .all();
+}
+
+export function getSuspensionRow(db, id) {
+  return db.prepare('SELECT * FROM suspensions WHERE id = ?').get(id);
+}
+
+// 与 [startIso, endIso) 重叠的生效中停用（左闭右开：start < end 且自身 start < endIso）
+export function listOverlappingActiveSuspensions(db, startIso, endIso) {
+  return db
+    .prepare(
+      `SELECT * FROM suspensions
+        WHERE status = 'active' AND start_utc < ? AND ? < end_utc`,
+    )
+    .all(endIso, startIso);
+}
+
+export function listActiveSuspensions(db) {
+  return db.prepare(`SELECT * FROM suspensions WHERE status = 'active'`).all();
+}
+
+export function insertSuspension(db, { mass, quantity, reason, startUtc, endUtc }) {
+  const info = db
+    .prepare(
+      `INSERT INTO suspensions (mass, quantity, reason, start_utc, end_utc)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(mass, quantity, reason, startUtc, endUtc);
+  return getSuspensionRow(db, info.lastInsertRowid);
+}
+
+// 撤销：仅生效中且未开始的停用可撤销（条件更新，未命中返回 null）。
+export function revokeSuspension(db, id, nowIso) {
+  const info = db
+    .prepare(
+      `UPDATE suspensions
+          SET status = 'revoked', revoked_at = ?
+        WHERE id = ? AND status = 'active' AND start_utc > ?`,
+    )
+    .run(nowIso, id, nowIso);
+  return info.changes === 1 ? getSuspensionRow(db, id) : null;
 }
 
 // 核验列表（连发布表取冻结依据与发布编号）

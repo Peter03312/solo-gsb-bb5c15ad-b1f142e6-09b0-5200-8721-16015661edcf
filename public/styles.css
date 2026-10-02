@@ -250,6 +250,7 @@ pre {
 .ver-table td input[type="text"],
 .ver-table td input[type="number"] { min-width: 130px; }
 tr.row-bad { background: var(--bad-bg); }
+tr.row-stale { opacity: 0.6; }
 .inp-bad {
   border-color: var(--bad) !important;
   outline: 2px solid rgba(198, 40, 40, 0.25);
