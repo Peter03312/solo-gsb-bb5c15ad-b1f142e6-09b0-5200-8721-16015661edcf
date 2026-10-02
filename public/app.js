@@ -82,6 +82,7 @@ function renderAll() {
   renderPublications();
   renderVerifications();
   renderReservations();
+  renderDeactivations();
 }
 
 function renderHoleMax(d) {
@@ -780,38 +781,43 @@ async function loadSchedule() {
   const sch = await api('GET', '/api/schedule');
   const box = $('#res-schedule');
   if (!sch.specs || sch.specs.length === 0) {
-    box.innerHTML = '<div class="muted">当前无生效中的预约占用。</div>';
+    box.innerHTML = '<div class="muted">当前无生效中的预约占用或停用。</div>';
     return;
   }
   box.innerHTML = sch.specs
-    .map(
-      (s) => `<div class="spec-block">
+    .map((s) => {
+      const badges = [];
+      if (s.shortage) badges.push('<span class="badge bad">✗ 存在不足区段（占用超库存）</span>');
+      if (s.combinedShortage) badges.push('<span class="badge bad">✗ 占用加停用不足</span>');
+      if (!s.shortage && !s.combinedShortage) {
+        badges.push('<span class="badge ok">✓ 数量充足</span>');
+      }
+      return `<div class="spec-block">
       <div class="spec-head">
         <b>规格 ${s.mass} g</b>
-        <span class="muted">当前可选 ${s.capacity} 枚 · 时段内峰值占用 ${s.peak} 枚</span>
-        <span class="badge ${s.shortage ? 'bad' : 'ok'}">${
-          s.shortage ? '✗ 存在不足区段' : '✓ 数量充足'
-        }</span>
+        <span class="muted">当前可选 ${s.capacity} 枚 · 时段内峰值占用 ${s.peak} 枚 · 峰值停用 ${s.deactivatedPeak} 枚</span>
+        ${badges.join('')}
       </div>
       ${
         s.segments.length
           ? `<table class="pair-list">
-        <thead><tr><th>时段（UTC）</th><th>占用量</th><th>判定</th></tr></thead>
+        <thead><tr><th>时段（UTC）</th><th>占用量</th><th>停用量</th><th>判定</th></tr></thead>
         <tbody>${s.segments
           .map(
-            (g) => `<tr${g.shortage ? ' class="row-bad"' : ''}>
+            (g) => `<tr${g.shortage || g.combinedShortage ? ' class="row-bad"' : ''}>
             <td class="mono">${g.start} 至 ${g.end}</td>
             <td>${g.used} / ${s.capacity} 枚</td>
-            <td class="${g.shortage ? 'tag-bad' : 'tag-ok'}">${
-              g.shortage ? '✗ 不足' : '✓'
+            <td>${g.deactivated} 枚</td>
+            <td class="${g.shortage || g.combinedShortage ? 'tag-bad' : 'tag-ok'}">${
+              g.shortage ? '✗ 不足' : g.combinedShortage ? '✗ 占用加停用不足' : '✓'
             }</td>
           </tr>`,
           )
           .join('')}</tbody></table>`
-          : '<div class="muted">该时段内无占用。</div>'
+          : '<div class="muted">该时段内无占用或停用。</div>'
       }
-    </div>`,
-    )
+    </div>`;
+    })
     .join('');
 }
 
@@ -839,7 +845,7 @@ $('#res-submit').addEventListener('click', async () => {
         : `批次号「${r.batchNo}」预约已登记（占用 ${usageText(r.usage)}）。`,
     );
   } catch (e) {
-    // 容量不足：展示冲突规格与时段
+    // 容量不足：展示冲突规格与时段（含同期停用量）
     const conflicts = e.data && e.data.detail && e.data.detail.conflicts;
     if (e.status === 409 && conflicts) {
       $('#res-conflict').innerHTML = `<div class="banner bad">
@@ -849,7 +855,11 @@ $('#res-submit').addEventListener('click', async () => {
             (c) =>
               `<li>规格 ${c.mass} g：本次需 ${c.required} 枚，当前可选 ${c.capacity} 枚；` +
               `冲突时段：${c.windows
-                .map((w) => `${w.start} 至 ${w.end}（已占用 ${w.used} 枚）`)
+                .map(
+                  (w) =>
+                    `${w.start} 至 ${w.end}（已占用 ${w.used} 枚` +
+                    `${w.deactivated > 0 ? `、停用 ${w.deactivated} 枚` : ''}）`,
+                )
                 .join('；')}</li>`,
           )
           .join('')}</ul>
@@ -865,6 +875,108 @@ async function cancelReservation(id) {
   try {
     await api('POST', `/api/reservations/${id}/cancel`);
     await refresh(`预约 #${id} 已取消（历史保留，占用已释放）。`);
+  } catch (e) {
+    showAlert(e.message, 'err');
+  }
+}
+
+// ---------- 配重块临时停用 ----------
+
+const DEACT_PHASE_LABEL = {
+  notStarted: '未开始',
+  ongoing: '进行中',
+  ended: '已结束',
+  revoked: '已撤销',
+};
+
+function renderDeactivations() {
+  // 规格下拉：当前录入的配重规格
+  const sel = $('#deact-mass');
+  const weights = state.data ? state.data.weights : [];
+  const prev = sel.value;
+  sel.innerHTML = weights.length
+    ? weights
+        .map((w) => `<option value="${w.mass}">${w.mass} g（当前 ${w.quantity} 枚）</option>`)
+        .join('')
+    : '<option value="">（暂无已录入配重规格）</option>';
+  if (weights.some((w) => String(w.mass) === prev)) sel.value = prev;
+
+  // 停用记录列表
+  const box = $('#deact-list');
+  const list = state.deactivations || [];
+  if (list.length === 0) {
+    box.innerHTML = '<div class="muted">暂无停用记录。</div>';
+    return;
+  }
+  box.innerHTML = `<div class="table-wrap"><table class="res-table">
+    <thead><tr>
+      <th>规格</th><th>停用数量</th><th>原因</th><th>时段（UTC，左闭右开）</th><th>状态</th><th></th>
+    </tr></thead><tbody>${list
+      .map(
+        (d) => `<tr>
+      <td><b>${d.mass} g</b></td>
+      <td>${d.quantity} 枚</td>
+      <td>${escapeHtml(d.reason)}</td>
+      <td class="mono">${d.startUtc}<br>至 ${d.endUtc}</td>
+      <td><span class="badge ${
+        d.status === 'revoked' ? 'bad' : d.phase === 'ended' ? 'stale' : 'ok'
+      }">${DEACT_PHASE_LABEL[d.phase]}</span></td>
+      <td>${
+        d.revocable
+          ? `<button data-deact-revoke="${d.id}" class="danger">撤销停用</button>`
+          : ''
+      }</td>
+    </tr>`,
+      )
+      .join('')}</tbody></table></div>`;
+  box.querySelectorAll('[data-deact-revoke]').forEach((b) =>
+    b.addEventListener('click', () => revokeDeactivation(Number(b.dataset.deactRevoke))),
+  );
+}
+
+$('#deact-submit').addEventListener('click', async () => {
+  const mass = Number($('#deact-mass').value);
+  const quantity = Number($('#deact-qty').value);
+  const reason = $('#deact-reason').value.trim();
+  const startUtc = dtLocalToUtc($('#deact-start').value);
+  const endUtc = dtLocalToUtc($('#deact-end').value);
+  $('#deact-conflict').innerHTML = '';
+  try {
+    const d = await api('POST', '/api/deactivations', {
+      mass,
+      quantity,
+      reason,
+      startUtc,
+      endUtc,
+    });
+    await refresh(`已登记停用：${d.mass} g × ${d.quantity}（${d.startUtc} 至 ${d.endUtc}），新预约将按扣除停用后的可用量判定。`);
+  } catch (e) {
+    // 超量停用：展示冲突规格与时段
+    const conflicts = e.data && e.data.detail && e.data.detail.conflicts;
+    if (e.status === 409 && conflicts) {
+      $('#deact-conflict').innerHTML = `<div class="banner bad">
+        <b>停用数量超出该规格当前可选数量，停用未记录：</b>
+        <ul>${conflicts
+          .map(
+            (c) =>
+              `<li>规格 ${c.mass} g：本次需停用 ${c.required} 枚，当前数量 ${c.capacity} 枚；` +
+              `冲突时段：${c.windows
+                .map((w) => `${w.start} 至 ${w.end}（已停用 ${w.used} 枚）`)
+                .join('；')}</li>`,
+          )
+          .join('')}</ul>
+      </div>`;
+      showAlert(e.message, 'err');
+    } else {
+      showAlert(e.message, 'err');
+    }
+  }
+});
+
+async function revokeDeactivation(id) {
+  try {
+    await api('POST', `/api/deactivations/${id}/revoke`);
+    await refresh(`停用 #${id} 已撤销（历史保留，后续容量已释放）。`);
   } catch (e) {
     showAlert(e.message, 'err');
   }

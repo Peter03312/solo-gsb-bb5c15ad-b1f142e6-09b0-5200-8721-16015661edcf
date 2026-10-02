@@ -120,8 +120,41 @@
       <div id="res-conflict"></div>
       <h3>预约列表</h3>
       <div id="res-list"></div>
-      <h3>占用日程（按当前可选数量判定，超限区段标记「不足」）</h3>
+      <h3>占用日程（按当前可选数量判定，超限区段标记「不足」；另展示停用量与「占用加停用」不足区段）</h3>
       <div id="res-schedule"></div>
+    </section>
+
+    <section class="card" id="sec-deact">
+      <h2>8. 配重块临时停用</h2>
+      <div class="muted" style="margin-bottom:10px">
+        按质量规格登记临时停用（数量、原因、UTC 起止，<b>左闭右开 [开始, 结束)</b>）；
+        同规格重叠停用累加，任一时刻停用总量不得超过登记时该规格当前数量，超量拒绝且不留记录。
+        停用登记后即影响新预约的可用量（任一时刻 占用 + 停用 ≤ 当前库存），可与既有预约重叠；
+        仅未开始的停用可撤销，撤销保留历史并释放后续容量。
+      </div>
+      <div class="form-row">
+        <label>质量规格
+          <select id="deact-mass"></select>
+        </label>
+        <label>停用数量
+          <input id="deact-qty" type="number" step="1" min="1" value="1" />
+        </label>
+        <label>原因
+          <input id="deact-reason" type="text" placeholder="如 送检 / 损坏待修" />
+        </label>
+        <label>开始时间（UTC）
+          <input id="deact-start" type="datetime-local" step="60" />
+        </label>
+        <label>结束时间（UTC）
+          <input id="deact-end" type="datetime-local" step="60" />
+        </label>
+      </div>
+      <div class="actions">
+        <button id="deact-submit" class="primary">登记停用</button>
+      </div>
+      <div id="deact-conflict"></div>
+      <h3>停用记录</h3>
+      <div id="deact-list"></div>
     </section>
   </main>
 

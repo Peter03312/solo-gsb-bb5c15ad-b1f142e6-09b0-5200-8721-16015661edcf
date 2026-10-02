@@ -27,6 +27,12 @@ import {
   listActiveReservations,
   insertReservation,
   cancelReservation,
+  listDeactivationRows,
+  getDeactivationRow,
+  listOverlappingActiveDeactivations,
+  listActiveDeactivations,
+  insertDeactivation,
+  revokeDeactivation,
 } from './db.js';
 import { solve, verify, computeHash } from './solver.js';
 import { normalizeEntries, measureProgress, verifyMeasurements } from './verify.js';
@@ -76,6 +82,9 @@ export function createApp(db) {
       verifications: serializeVerifications(db, hash),
       reservations: listReservationRows(db).map((r) =>
         reservationView(r, hash, Date.now()),
+      ),
+      deactivations: listDeactivationRows(db).map((d) =>
+        deactivationView(d, Date.now()),
       ),
     });
   });
@@ -340,14 +349,31 @@ export function createApp(db) {
             usage: JSON.parse(r.usage_json),
           }),
         );
-        const check = checkCapacity({ usage, capacityOf, overlapping, startMs, endMs });
+        // 同事务重读重叠的生效中停用：任一时刻「占用 + 停用」不得超过当前库存
+        const deactivations = listOverlappingActiveDeactivations(db, startUtc, endUtc).map(
+          (d) => ({
+            startMs: Date.parse(d.start_utc),
+            endMs: Date.parse(d.end_utc),
+            mass: d.mass,
+            count: d.quantity,
+          }),
+        );
+        const check = checkCapacity({
+          usage,
+          capacityOf,
+          overlapping,
+          deactivations,
+          startMs,
+          endMs,
+        });
         if (!check.ok) {
           const errs = ['当前可选数量不足，预约未产生任何占用：'];
           for (const c of check.conflicts) {
             for (const w of c.windows) {
               errs.push(
-                `规格 ${c.mass} g：${w.start} 至 ${w.end} 已占用 ${w.used} 枚，` +
-                  `本次需 ${c.required} 枚，超出当前可选数量 ${c.capacity} 枚`,
+                `规格 ${c.mass} g：${w.start} 至 ${w.end} 已占用 ${w.used} 枚` +
+                  (w.deactivated > 0 ? `、停用 ${w.deactivated} 枚` : '') +
+                  `，本次需 ${c.required} 枚，超出当前可选数量 ${c.capacity} 枚`,
               );
             }
           }
@@ -411,14 +437,21 @@ export function createApp(db) {
     }
   });
 
-  // 预约日程：各质量规格在 [from, to) 内的分段占用与「不足」区段
-  // （占用超过当前录入数量即标记不足；既有预约不因数量减少/图失效被改写）
+  // 预约日程：各质量规格在 [from, to) 内的分段占用、停用量与「不足」区段
+  // （shortage 保持原含义：预约占用超过当前录入数量；另展示停用量 deactivated
+  //  与「占用加停用」超限的 combinedShortage 区段；既有预约/停用不被改写）
   app.get('/api/schedule', (req, res, next) => {
     try {
       const active = listActiveReservations(db).map((r) => ({
         startMs: Date.parse(r.start_utc),
         endMs: Date.parse(r.end_utc),
         usage: JSON.parse(r.usage_json),
+      }));
+      const deactivations = listActiveDeactivations(db).map((d) => ({
+        startMs: Date.parse(d.start_utc),
+        endMs: Date.parse(d.end_utc),
+        mass: d.mass,
+        count: d.quantity,
       }));
       const fromMs = parseUtcMs(req.query.from);
       const toMs = parseUtcMs(req.query.to);
@@ -428,20 +461,25 @@ export function createApp(db) {
       if (req.query.to !== undefined && toMs === null) {
         throw new ValidationError(['to 不是合法的 UTC 时间（ISO 8601）']);
       }
+      // 缺省窗口：覆盖全部生效中预约与生效中停用
+      const spans = [
+        ...active.map((r) => ({ s: r.startMs, e: r.endMs })),
+        ...deactivations.map((d) => ({ s: d.startMs, e: d.endMs })),
+      ];
       const from =
         fromMs !== null
           ? fromMs
-          : active.length
-            ? Math.min(...active.map((r) => r.startMs))
+          : spans.length
+            ? Math.min(...spans.map((x) => x.s))
             : Date.now();
       const to =
         toMs !== null
           ? toMs
-          : active.length
-            ? Math.max(...active.map((r) => r.endMs))
+          : spans.length
+            ? Math.max(...spans.map((x) => x.e))
             : from;
       if (!(from < to)) {
-        if (from === to && active.length === 0) {
+        if (from === to && spans.length === 0) {
           return res.json({ from: toIso(from), to: toIso(to), specs: [] });
         }
         throw new ValidationError(['from 必须早于 to（时段按左闭右开 [from, to) 计算）']);
@@ -454,14 +492,172 @@ export function createApp(db) {
       const massSet = new Set();
       if (data) for (const w of data.weights) massSet.add(w.mass);
       for (const r of active) for (const u of r.usage) massSet.add(u.mass);
+      for (const d of deactivations) massSet.add(d.mass);
       const specs = buildSchedule({
         reservations: active,
+        deactivations,
         masses: [...massSet].sort((a, b) => a - b),
         capacityOf,
         fromMs: from,
         toMs: to,
       });
       res.json({ from: toIso(from), to: toIso(to), specs });
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  // ---------- 配重块临时停用 ----------
+  //
+  // 按质量规格登记停用数量、原因与 UTC 起止（左闭右开 [start, end)）。
+  // 登记在单个事务内原子完成：重读当前录入数量与同规格重叠的生效中停用，
+  // 任一时刻停用总量不得超过登记时该规格当前数量；超量拒绝且不留记录。
+  // 停用可与既有预约重叠（既有预约不改写），登记后即影响新预约的可用量。
+  // 仅未开始的停用可撤销，撤销保留历史并释放后续容量。
+
+  // 列表/详情视图：状态、阶段（相对当前时刻）
+  function deactivationView(row, nowMs) {
+    const startMs = Date.parse(row.start_utc);
+    const endMs = Date.parse(row.end_utc);
+    const phase =
+      row.status === 'revoked'
+        ? 'revoked'
+        : nowMs < startMs
+          ? 'notStarted'
+          : nowMs < endMs
+            ? 'ongoing'
+            : 'ended';
+    return {
+      id: row.id,
+      mass: row.mass,
+      quantity: row.quantity,
+      reason: row.reason,
+      startUtc: row.start_utc,
+      endUtc: row.end_utc,
+      status: row.status,
+      phase,
+      revocable: row.status === 'active' && nowMs < startMs,
+      createdAt: row.created_at,
+      revokedAt: row.revoked_at,
+    };
+  }
+
+  app.post('/api/deactivations', (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const errors = [];
+      const mass = typeof body.mass === 'number' ? body.mass : NaN;
+      if (!Number.isFinite(mass) || !(mass > 0)) {
+        errors.push('质量规格必须为正数（当前录入的配重规格质量，单位 g）');
+      }
+      const quantity = body.quantity;
+      if (!Number.isInteger(quantity) || quantity < 1) {
+        errors.push('停用数量必须为正整数');
+      }
+      const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+      if (!reason) errors.push('停用原因不能为空');
+      else if (reason.length > 200) errors.push('停用原因过长（最多 200 字符）');
+      const startMs = parseUtcMs(body.startUtc);
+      const endMs = parseUtcMs(body.endUtc);
+      if (startMs === null) errors.push('开始时间不是合法的 UTC 时间（ISO 8601）');
+      if (endMs === null) errors.push('结束时间不是合法的 UTC 时间（ISO 8601）');
+      if (startMs !== null && endMs !== null && !(startMs < endMs)) {
+        errors.push('开始时间必须早于结束时间（时段按左闭右开 [start, end) 计算）');
+      }
+      if (errors.length) throw new ValidationError(errors);
+
+      const startUtc = toIso(startMs);
+      const endUtc = toIso(endMs);
+
+      let view;
+      const tx = db.transaction(() => {
+        // 原子重读：当前录入数量与同规格重叠的生效中停用
+        const data = loadData(db);
+        const spec = data && data.weights.find((w) => w.mass === mass);
+        if (!spec) {
+          throw new ValidationError([
+            `质量规格 ${mass} g 未在当前录入的配重块中登记（未知规格），停用未记录`,
+          ]);
+        }
+        const overlapping = listOverlappingActiveDeactivations(db, startUtc, endUtc)
+          .filter((d) => d.mass === mass)
+          .map((d) => ({
+            startMs: Date.parse(d.start_utc),
+            endMs: Date.parse(d.end_utc),
+            usage: [{ mass, count: d.quantity }],
+          }));
+        // 同规格重叠停用累加：任一时刻停用总量不得超过登记时该规格当前数量
+        const check = checkCapacity({
+          usage: [{ mass, count: quantity }],
+          capacityOf: () => spec.quantity,
+          overlapping,
+          startMs,
+          endMs,
+        });
+        if (!check.ok) {
+          const errs = ['停用数量超出该规格当前可选数量，停用未记录：'];
+          for (const c of check.conflicts) {
+            for (const w of c.windows) {
+              errs.push(
+                `规格 ${c.mass} g：${w.start} 至 ${w.end} 已停用 ${w.used} 枚，` +
+                  `本次需停用 ${c.required} 枚，超出当前数量 ${c.capacity} 枚`,
+              );
+            }
+          }
+          throw new ConflictError(errs, { detail: { conflicts: check.conflicts } });
+        }
+        const row = insertDeactivation(db, {
+          mass,
+          quantity,
+          reason,
+          startUtc,
+          endUtc,
+        });
+        view = deactivationView(row, Date.now());
+      });
+      tx();
+      res.status(201).json(view);
+    } catch (e) {
+      next(e);
+    }
+  });
+
+  app.get('/api/deactivations', (req, res) => {
+    const nowMs = Date.now();
+    res.json(listDeactivationRows(db).map((d) => deactivationView(d, nowMs)));
+  });
+
+  app.get('/api/deactivations/:id', (req, res, next) => {
+    const row = getDeactivationRow(db, Number(req.params.id));
+    if (!row) return res.status(404).json({ error: '停用记录不存在' });
+    res.json(deactivationView(row, Date.now()));
+  });
+
+  // 撤销：仅未开始的停用可撤销；已撤销的幂等返回原记录（历史保留，容量已释放）
+  app.post('/api/deactivations/:id/revoke', (req, res, next) => {
+    try {
+      const id = Number(req.params.id);
+      const existed = getDeactivationRow(db, id);
+      if (!existed) return res.status(404).json({ error: '停用记录不存在' });
+      let view;
+      const tx = db.transaction(() => {
+        const row = getDeactivationRow(db, id);
+        if (row.status === 'revoked') {
+          view = deactivationView(row, Date.now());
+          return;
+        }
+        const nowMs = Date.now();
+        if (nowMs >= Date.parse(row.start_utc)) {
+          throw new ConflictError([
+            `停用 #${id} 已开始（${row.start_utc}），仅未开始的停用可撤销`,
+          ]);
+        }
+        const updated = revokeDeactivation(db, id, toIso(nowMs));
+        if (!updated) throw new ConflictError([`停用 #${id} 状态已变化，请刷新后重试`]);
+        view = deactivationView(updated, nowMs);
+      });
+      tx();
+      res.json(view);
     } catch (e) {
       next(e);
     }

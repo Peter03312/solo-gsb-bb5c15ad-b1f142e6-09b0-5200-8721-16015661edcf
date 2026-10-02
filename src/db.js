@@ -80,6 +80,21 @@ CREATE TABLE IF NOT EXISTS reservations (
   FOREIGN KEY (publication_id) REFERENCES publications(id)
 );
 
+-- 配重块临时停用：按质量规格登记停用数量、原因与 UTC 起止（左闭右开）。
+-- 同规格重叠停用累加，登记时校验任一时刻停用总量不超过该规格当前录入数量；
+-- 撤销仅置 status/revoked_at，历史保留且不再占用容量。
+CREATE TABLE IF NOT EXISTS deactivations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  mass REAL NOT NULL,
+  quantity INTEGER NOT NULL,
+  reason TEXT NOT NULL,
+  start_utc TEXT NOT NULL,
+  end_utc TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  revoked_at TEXT
+);
+
 -- 现场装载核验：一条发布记录至多一份（草稿或完成），UNIQUE 约束兜底。
 -- version 为乐观锁：每次暂存自增，更新须携带旧版本以防覆盖他人修改。
 -- 完成后 completed_at 置位、result_json 冻结，之后草稿与完成结果均不可改写。
@@ -344,6 +359,54 @@ export function cancelReservation(db, id, nowIso) {
     )
     .run(nowIso, id, nowIso);
   return info.changes === 1 ? getReservationRow(db, id) : null;
+}
+
+// ---------- 配重块临时停用 ----------
+
+export function listDeactivationRows(db) {
+  return db
+    .prepare('SELECT * FROM deactivations ORDER BY start_utc, id')
+    .all();
+}
+
+export function getDeactivationRow(db, id) {
+  return db.prepare('SELECT * FROM deactivations WHERE id = ?').get(id);
+}
+
+// 与 [startIso, endIso) 重叠的生效中停用（左闭右开：d.start < end 且 start < d.end）
+export function listOverlappingActiveDeactivations(db, startIso, endIso) {
+  return db
+    .prepare(
+      `SELECT * FROM deactivations
+        WHERE status = 'active' AND start_utc < ? AND ? < end_utc`,
+    )
+    .all(endIso, startIso);
+}
+
+export function listActiveDeactivations(db) {
+  return db.prepare(`SELECT * FROM deactivations WHERE status = 'active'`).all();
+}
+
+export function insertDeactivation(db, { mass, quantity, reason, startUtc, endUtc }) {
+  const info = db
+    .prepare(
+      `INSERT INTO deactivations (mass, quantity, reason, start_utc, end_utc)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(mass, quantity, reason, startUtc, endUtc);
+  return getDeactivationRow(db, info.lastInsertRowid);
+}
+
+// 撤销：仅生效中且未开始的停用可撤销（条件更新，未命中返回 null）。
+export function revokeDeactivation(db, id, nowIso) {
+  const info = db
+    .prepare(
+      `UPDATE deactivations
+          SET status = 'revoked', revoked_at = ?
+        WHERE id = ? AND status = 'active' AND start_utc > ?`,
+    )
+    .run(nowIso, id, nowIso);
+  return info.changes === 1 ? getDeactivationRow(db, id) : null;
 }
 
 // 核验列表（连发布表取冻结依据与发布编号）

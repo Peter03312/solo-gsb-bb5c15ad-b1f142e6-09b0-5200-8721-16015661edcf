@@ -20,11 +20,21 @@
 实验室在不同时段复用配重块：操作者凭**批次号 + 当前可用的已发布装载图 + UTC 起止时间**
 预约配重块（起点须早于终点，非法时间或未知图一律拒绝）。时段按**左闭右开** `[start, end)`
 计算，占用量按**冻结图**统计到各质量规格；创建预约在**单个数据库事务**内原子重读冻结图、
-当前可选数量与重叠的生效中预约——任一时刻同规格预约总量不得超过当前录入数量，
-不足时返回**冲突规格与时段**且**不产生任何部分占用**。批次号为幂等键：同号同内容重复提交
+当前可选数量、重叠的生效中预约与生效中停用——任一时刻同规格**预约占用加停用**总量不得
+超过当前录入数量，不足时返回**冲突规格与时段**且**不产生任何部分占用**。批次号为幂等键：同号同内容重复提交
 返回原记录，同号不同内容拒绝；**仅未开始的预约可取消**，取消后保留历史且同号重试不重新占用。
 录入数量减少或图失效**不改写既有预约**，后续预约仍按当前数量与图可用性判定，
 预约日程中展示已有占用及不足区段。
+
+实验室可登记配重块**临时停用**：按质量规格填写停用数量、原因与 UTC 起止时间
+（左闭右开 `[start, end)`）。同规格重叠停用**累加**，登记时在**单个数据库事务**内
+原子重读该规格当前数量与重叠的生效中停用——任一时刻停用总量不得超过**登记时**
+该规格当前数量，超量（或非法时间、非法数量、未知规格）一律拒绝且**不留下任何记录**。
+停用登记后即影响新预约的可用量：预约事务内同时核对当前库存、重叠的生效停用与
+已有预约，任一时刻**占用加停用**超出库存则整单拒绝并指出规格与冲突时段。
+停用**可与既有预约重叠**，既有预约不改写；日程中原有「不足」字段仍只表示
+**预约占用超出当前库存**，另展示**停用量**与**占用加停用**的不足区段。
+**仅未开始的停用可撤销**，撤销保留历史并释放后续容量。
 
 ## 约束模型
 
@@ -123,13 +133,22 @@ npm test
    1. 选择「✓ 可用于当前装载」的发布图，填写批次号与 UTC 起止时间（页面输入按 UTC 解释），
       提交预约。占用量按冻结图统计（如 `50 g × 1`）。
    2. 时段按左闭右开计算：前一条的终点与后一条的起点相接时互不冲突。
-   3. 数量不足时页面列出冲突规格与时段（既有占用、本次需求、当前可选数量），
+   3. 数量不足时页面列出冲突规格与时段（既有占用、同期停用、本次需求、当前可选数量），
       本次预约不产生任何占用。
    4. 同批次号同内容重复提交返回原记录（已取消的亦返回原取消记录，不重新占用）；
       同号不同内容被拒绝。
    5. 仅未开始的预约可「取消预约」；取消后历史保留、占用释放。
-   6. 「占用日程」按当前录入数量展示各规格的分段占用；数量减少或图失效后，
-      既有预约保持不变，超出当前数量的区段标记为「不足」。
+   6. 「占用日程」按当前录入数量展示各规格的分段占用与停用量；数量减少或图失效后，
+      既有预约保持不变，占用超出当前数量的区段标记为「不足」，占用加停用超限的区段
+      另标记为「占用加停用不足」。
+8. **配重块临时停用**（第 8 节）：
+   1. 选择当前录入的质量规格，填写停用数量、原因与 UTC 起止时间（左闭右开），登记停用。
+   2. 同规格重叠停用累加：任一时刻停用总量超过登记时该规格当前数量即被拒绝，
+      页面列出冲突规格与时段，且不留下任何记录。
+   3. 停用登记后即影响新预约：预约事务内同时核对当前库存、重叠生效停用与已有预约，
+      任一时刻占用加停用超出库存则整单拒绝。
+   4. 停用可与既有预约重叠，既有预约不改写；日程另展示停用量与「占用加停用」不足区段。
+   5. 仅未开始的停用可「撤销停用」；撤销保留历史并释放后续容量，重复撤销幂等返回原记录。
 
 ## REST API 摘要
 
@@ -148,17 +167,22 @@ npm test
 | GET | `/api/verifications/:id` | 核验详情（冻结快照、暂存/冻结录入；完成后附判定明细） |
 | PUT | `/api/verifications/:id` | 暂存孔位录入（整表替换），须携带 `version`；过期返回 409 |
 | POST | `/api/verifications/:id/complete` | 事务内重读快照与当前数据完成判定；不通过 400（原因定位孔位/孔对，草稿保留）；重复完成幂等 200 |
-| POST | `/api/reservations` | 创建配重块时段预约（批次号 + 可用发布图 + UTC 起止，左闭右开）；事务内原子重读图/当前数量/重叠预约；201 新建、200 幂等重放、400 非法输入或图不可用、409 批次冲突或数量不足（附冲突规格与时段） |
+| POST | `/api/reservations` | 创建配重块时段预约（批次号 + 可用发布图 + UTC 起止，左闭右开）；事务内原子重读图/当前数量/重叠预约与生效停用（占用 + 停用 ≤ 库存）；201 新建、200 幂等重放、400 非法输入或图不可用、409 批次冲突或数量不足（附冲突规格与时段，含同期停用量） |
 | GET | `/api/reservations` | 预约列表（含状态、阶段、依据图当前可用性、各规格占用） |
 | GET | `/api/reservations/:id` | 单条预约详情 |
 | POST | `/api/reservations/:id/cancel` | 取消预约（仅未开始）；已取消幂等返回原记录；已开始 409 |
-| GET | `/api/schedule?from=&to=` | 预约日程：各质量规格在时段内的分段占用、峰值与「不足」区段（按当前录入数量判定）；from/to 缺省为覆盖全部生效中预约 |
+| GET | `/api/schedule?from=&to=` | 预约日程：各质量规格在时段内的分段占用、停用量、峰值与不足区段（`shortage` 仅表示预约占用超出当前录入数量；`combinedShortage` 表示占用加停用超限）；from/to 缺省为覆盖全部生效中预约与停用 |
+| POST | `/api/deactivations` | 登记配重块临时停用（质量规格 + 数量 + 原因 + UTC 起止，左闭右开）；事务内原子重读当前数量与同规格重叠生效停用；201 新建、400 非法时间/数量/未知规格、409 超量停用（附冲突规格与时段）；拒绝不留记录 |
+| GET | `/api/deactivations` | 停用列表（含状态、阶段、是否可撤销） |
+| GET | `/api/deactivations/:id` | 单条停用详情 |
+| POST | `/api/deactivations/:id/revoke` | 撤销停用（仅未开始）；已撤销幂等返回原记录；已开始 409 |
 
 错误统一返回 `400 {"error","errors":[...]}`；状态冲突（草稿已存在、版本过期、核验已冻结、
-预约批次号冲突、配重数量不足等）返回 `409` 并附带 `existingId` / `currentVersion` 等字段。
+预约批次号冲突、配重数量不足、停用超量等）返回 `409` 并附带 `existingId` / `currentVersion` 等字段。
 核验完成失败时 400 响应的 `detail.checks` 内带逐孔（`objectMatch`、`withinCapacity`）与
-逐对（`withinTolerance`）判定，可直接用于前端高亮定位；预约数量不足时 409 响应的
-`detail.conflicts` 内带冲突规格、当前可选数量与超限时段（`windows`），可直接用于日程定位。
+逐对（`withinTolerance`）判定，可直接用于前端高亮定位；预约数量不足或停用超量时 409 响应的
+`detail.conflicts` 内带冲突规格、当前可选数量与超限时段（`windows`，含各窗内占用 `used`
+与停用 `deactivated` 峰值），可直接用于日程定位。
 
 ## 现场核验 HTTP API 调用示例
 
@@ -248,26 +272,93 @@ curl -s -X POST $BASE/api/reservations \
 #    取消后同批次号同内容重试仍返回该取消记录（不重新占用）
 curl -s -X POST $BASE/api/reservations/2/cancel
 
-# 6) 预约列表 / 单条 / 日程（from/to 可省略，缺省覆盖全部生效中预约）
+# 6) 预约列表 / 单条 / 日程（from/to 可省略，缺省覆盖全部生效中预约与停用）
 curl -s $BASE/api/reservations
 curl -s $BASE/api/reservations/1
 curl -s "$BASE/api/schedule?from=2026-10-03T00:00:00Z&to=2026-10-04T00:00:00Z"
 # -> {"from":"...","to":"...","specs":[{"mass":50,"capacity":1,"peak":1,
-#      "shortage":false,"segments":[{"start":"...","end":"...","used":1,"shortage":false}]}]}
+#      "shortage":false,"deactivatedPeak":0,"combinedShortage":false,
+#      "segments":[{"start":"...","end":"...","used":1,"deactivated":0,
+#        "shortage":false,"combinedShortage":false}]}]}
 #    录入数量减少后：既有预约不变，capacity 随之下降，占用超限的区段 shortage=true
+```
+
+## 配重块临时停用 HTTP API 调用示例
+
+```bash
+BASE=http://localhost:8080
+
+# 1) 登记停用：质量规格 + 停用数量 + 原因 + UTC 起止（左闭右开 [start, end)）
+#    事务内重读该规格当前数量与同规格重叠的生效停用；201 新建成功
+curl -s -X POST $BASE/api/deactivations \
+  -H 'Content-Type: application/json' \
+  -d '{"mass":50,"quantity":1,"reason":"送检",
+       "startUtc":"2026-10-03T08:00:00Z","endUtc":"2026-10-03T12:00:00Z"}'
+# -> {"id":1,"mass":50,"quantity":1,"reason":"送检",
+#     "startUtc":"2026-10-03T08:00:00.000Z","endUtc":"2026-10-03T12:00:00.000Z",
+#     "status":"active","phase":"notStarted","revocable":true,...}
+
+# 2) 超量停用：同规格重叠累加后任一时刻超过当前数量 → 409，不留任何记录
+#    （例：当前 50 g 共 1 枚，[10,14) 再停用 1 枚 → [10,12) 内累加为 2 > 1）
+curl -s -X POST $BASE/api/deactivations \
+  -H 'Content-Type: application/json' \
+  -d '{"mass":50,"quantity":1,"reason":"损坏待修",
+       "startUtc":"2026-10-03T10:00:00Z","endUtc":"2026-10-03T14:00:00Z"}'
+# -> 409 {"errors":["停用数量超出该规格当前可选数量，停用未记录：",
+#                   "规格 50 g：2026-10-03T10:00:00.000Z 至 2026-10-03T12:00:00.000Z
+#                    已停用 1 枚，本次需停用 1 枚，超出当前数量 1 枚"],
+#         "detail":{"conflicts":[{"mass":50,"required":1,"capacity":1,"peak":1,
+#                    "windows":[{"start":"...","end":"...","used":1,"deactivated":0}]}]}}
+#    （此接口 conflicts.windows 的 used 表示该窗内既有停用量）
+
+# 3) 非法时间（起点不早于终点）、非法数量（非正整数）、未知规格、缺原因
+#    → 400，同样不留记录
+curl -s -X POST $BASE/api/deactivations \
+  -H 'Content-Type: application/json' \
+  -d '{"mass":999,"quantity":1,"reason":"x",
+       "startUtc":"2026-10-03T08:00:00Z","endUtc":"2026-10-03T09:00:00Z"}'
+# -> 400 {"errors":["质量规格 999 g 未在当前录入的配重块中登记（未知规格），停用未记录"]}
+
+# 4) 停用影响新预约：占用 + 停用超出库存 → 预约整单 409，
+#    冲突时段内同时给出已占用（used）与停用（deactivated）
+curl -s -X POST $BASE/api/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"batchNo":"BATCH-009","publicationId":1,
+       "startUtc":"2026-10-03T10:00:00Z","endUtc":"2026-10-03T11:00:00Z"}'
+# -> 409 {"errors":[..."已占用 0 枚、停用 1 枚，本次需 1 枚，超出当前可选数量 1 枚"],
+#         "detail":{"conflicts":[{"mass":50,...,
+#                    "windows":[{"start":"...","end":"...","used":0,"deactivated":1}]}]}}
+
+# 5) 日程另展示停用量与「占用加停用」不足区段
+#    （shortage 仍只表示预约占用超出当前库存；combinedShortage 为占用加停用超限）
+curl -s "$BASE/api/schedule?from=2026-10-03T00:00:00Z&to=2026-10-04T00:00:00Z"
+# -> {"specs":[{"mass":50,"capacity":1,"peak":0,"shortage":false,
+#      "deactivatedPeak":1,"combinedShortage":true,
+#      "segments":[{"start":"...08:00...","end":"...12:00...","used":0,
+#        "deactivated":1,"shortage":false,"combinedShortage":true}]}]}
+
+# 6) 撤销：仅未开始的停用可撤销；重复撤销幂等返回原记录；
+#    撤销后历史保留、容量释放（新预约/新停用立即可用该时段）
+curl -s -X POST $BASE/api/deactivations/1/revoke
+# -> {"id":1,"status":"revoked","phase":"revoked","revokedAt":"...",...}
+curl -s -X POST $BASE/api/deactivations/1/revoke   # 幂等，仍 200 返回原记录
+
+# 7) 停用列表 / 单条
+curl -s $BASE/api/deactivations
+curl -s $BASE/api/deactivations/1
 ```
 
 ## 目录结构
 
 ```
 src/
-  server.js     Express 服务与路由、原子发布/核验/预约事务
+  server.js     Express 服务与路由、原子发布/核验/预约/停用事务
   db.js         SQLite 连接、建表、数据访问
   solver.js     求解器、独立复核、数据指纹（纯函数，含测试）
   verify.js     现场核验：录入规整、进度、完成判定（纯函数，含测试）
-  reserve.js    时段预约：UTC 时间解析、冻结图占用统计、扫描线容量判定与日程（纯函数，含测试）
+  reserve.js    时段预约与临时停用：UTC 时间解析、冻结图占用统计、双维度（占用×停用）扫描线容量判定与日程（纯函数，含测试）
   validate.js   输入校验（非法质量/重复编号/越界）、400/409 错误类型
 public/         浏览器界面（原生 HTML/CSS/JS，无需构建）
-test/           node --test 测试（求解器 + HTTP API + 核验 + 时段预约，共 60 项）
+test/           node --test 测试（求解器 + HTTP API + 核验 + 时段预约 + 临时停用，共 75 项）
 Dockerfile / docker-compose.yml
 ```

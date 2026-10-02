@@ -6,6 +6,7 @@ import {
   parseUtcMs,
   planUsage,
   occupancySegments,
+  mergeSegments,
   checkCapacity,
   buildSchedule,
 } from '../src/reserve.js';
@@ -432,6 +433,71 @@ test('buildSchedule：占用分段与不足标记', () => {
       [2, false],
       [3, true],
       [1, false],
+    ],
+  );
+});
+
+test('mergeSegments：双维度时间轴合并', () => {
+  const used = occupancySegments([{ startMs: 0, endMs: 10, count: 1 }], 0, 20);
+  const deact = occupancySegments([{ startMs: 5, endMs: 15, count: 2 }], 0, 20);
+  const merged = mergeSegments(used, deact, 0, 20);
+  assert.deepEqual(merged, [
+    { startMs: 0, endMs: 5, used: 1, deactivated: 0 },
+    { startMs: 5, endMs: 10, used: 1, deactivated: 2 },
+    { startMs: 10, endMs: 15, used: 0, deactivated: 2 },
+    { startMs: 15, endMs: 20, used: 0, deactivated: 0 },
+  ]);
+});
+
+test('checkCapacity：占用加停用超出库存时拒绝并给出双维度冲突时段', () => {
+  const r = checkCapacity({
+    usage: [{ mass: 50, count: 1 }],
+    capacityOf: () => 2,
+    overlapping: [{ startMs: 0, endMs: 10, usage: [{ mass: 50, count: 1 }] }],
+    deactivations: [{ startMs: 5, endMs: 15, mass: 50, count: 1 }],
+    startMs: 0,
+    endMs: 20,
+  });
+  assert.equal(r.ok, false);
+  const c = r.conflicts[0];
+  assert.equal(c.peak, 1); // 仅统计预约占用
+  assert.equal(c.deactivatedPeak, 1);
+  // 仅 [5,10) 内 占用1 + 停用1 + 本次1 = 3 > 2
+  assert.equal(c.windows.length, 1);
+  assert.equal(c.windows[0].used, 1);
+  assert.equal(c.windows[0].deactivated, 1);
+  // 停用不参与时（缺省 deactivations）行为不变
+  const ok = checkCapacity({
+    usage: [{ mass: 50, count: 1 }],
+    capacityOf: () => 2,
+    overlapping: [{ startMs: 0, endMs: 10, usage: [{ mass: 50, count: 1 }] }],
+    startMs: 0,
+    endMs: 20,
+  });
+  assert.equal(ok.ok, true);
+});
+
+test('buildSchedule：展示停用量与占用加停用不足区段，不足字段含义不变', () => {
+  const specs = buildSchedule({
+    reservations: [{ startMs: 0, endMs: 10, usage: [{ mass: 50, count: 1 }] }],
+    deactivations: [{ startMs: 5, endMs: 15, mass: 50, count: 1 }],
+    masses: [50],
+    capacityOf: () => 1,
+    fromMs: 0,
+    toMs: 20,
+  });
+  assert.equal(specs.length, 1);
+  const s = specs[0];
+  assert.equal(s.peak, 1);
+  assert.equal(s.shortage, false); // 占用 1 ≤ 1：不足仍只看占用
+  assert.equal(s.deactivatedPeak, 1);
+  assert.equal(s.combinedShortage, true); // [5,10) 占用1+停用1=2 > 1
+  assert.deepEqual(
+    s.segments.map((g) => [g.used, g.deactivated, g.shortage, g.combinedShortage]),
+    [
+      [1, 0, false, false],
+      [1, 1, false, true],
+      [0, 1, false, false],
     ],
   );
 });

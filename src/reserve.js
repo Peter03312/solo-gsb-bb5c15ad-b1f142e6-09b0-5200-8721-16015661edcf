@@ -1,12 +1,14 @@
-// 配重块时段预约（纯函数，无数据库依赖，便于测试）。
+// 配重块时段预约与临时停用（纯函数，无数据库依赖，便于测试）。
 //
 // 语义约定：
 //   - 时段一律按左闭右开 [start, end) 计算：终点与起点相接的两个预约互不重叠；
 //   - 每条预约按其所依据的冻结装载图统计各质量规格的占用量；
-//   - 任一时刻、任一质量规格，全部生效中（未取消）预约的占用总量不得超过
-//     当前录入的可选数量；
-//   - 判定一律使用「当前录入数量」与「当前图可用性」；既有预约不因数量减少
-//     或图失效而被改写，只在日程中把超限区段标记为「不足」。
+//   - 任一时刻、任一质量规格，全部生效中（未取消）预约的占用总量加上生效中
+//     （未撤销）停用的停用总量，不得超过当前录入的可选数量；
+//   - 停用登记只与同规格生效中停用累加比较（不超过登记时该规格当前数量），
+//     可与既有预约重叠；既有预约/停用均不因后续数据变化而被改写；
+//   - 判定一律使用「当前录入数量」与「当前图可用性」；日程中占用超限区段
+//     标记为「不足」，另展示停用量与「占用加停用」超限的不足区段。
 
 // ISO 8601 形状（允许日期型、空格分隔、省略秒、省略时区——省略时区按 UTC 处理）
 const ISO_RE =
@@ -85,14 +87,68 @@ export function occupancySegments(intervals, s, e) {
   return segments;
 }
 
+// ---------- 双维度合并：占用（预约）× 停用 ----------
+// usedSegs / deactSegs 均为 occupancySegments 的输出（在 [s,e) 上分段恒定、完整覆盖）。
+// 返回 [{startMs, endMs, used, deactivated}]：同一时间轴上两个维度分别分段恒定，
+// 相邻段的 (used, deactivated) 不完全相同。
+export function mergeSegments(usedSegs, deactSegs, s, e) {
+  const bounds = new Set([s, e]);
+  for (const seg of usedSegs) {
+    bounds.add(seg.startMs);
+    bounds.add(seg.endMs);
+  }
+  for (const seg of deactSegs) {
+    bounds.add(seg.startMs);
+    bounds.add(seg.endMs);
+  }
+  const pts = [...bounds].sort((a, b) => a - b);
+  const at = (segs, t) => {
+    for (const seg of segs) {
+      if (seg.startMs <= t && t < seg.endMs) return seg.used;
+    }
+    return 0;
+  };
+  const out = [];
+  for (let i = 0; i + 1 < pts.length; i += 1) {
+    const a = pts[i];
+    const b = pts[i + 1];
+    if (a >= b) continue;
+    const used = at(usedSegs, a);
+    const deactivated = at(deactSegs, a);
+    const last = out[out.length - 1];
+    if (last && last.endMs === a && last.used === used && last.deactivated === deactivated) {
+      last.endMs = b;
+    } else {
+      out.push({ startMs: a, endMs: b, used, deactivated });
+    }
+  }
+  return out;
+}
+
+// 把扁平停用列表 [{startMs, endMs, mass, count}] 中某规格的区间取出
+function deactivationIntervals(deactivations, mass) {
+  const intervals = [];
+  for (const d of deactivations || []) {
+    if (d.mass === mass && d.count > 0) {
+      intervals.push({ startMs: d.startMs, endMs: d.endMs, count: d.count });
+    }
+  }
+  return intervals;
+}
+
 // ---------- 容量判定 ----------
-// usage:       本次预约各规格占用 [{mass, count}]
-// capacityOf:  (mass) => 当前录入可选数量（无该规格返回 0）
-// overlapping: 与 [startMs,endMs) 重叠的生效中预约 [{startMs, endMs, usage:[{mass,count}]}]
+// usage:         本次预约各规格占用 [{mass, count}]
+// capacityOf:    (mass) => 当前录入可选数量（无该规格返回 0）
+// overlapping:   与 [startMs,endMs) 重叠的生效中预约 [{startMs, endMs, usage:[{mass,count}]}]
+// deactivations: 与 [startMs,endMs) 重叠的生效中停用 [{startMs, endMs, mass, count}]（可缺省）
+// 判定：任一时刻「既有占用 + 生效停用 + 本次需求 ≤ 当前数量」。
 // 返回 { ok, conflicts }；conflicts 元素：
-//   { mass, required, capacity, peak, windows:[{start,end,used}] }
-//   windows 为「既有占用 + 本次需求 > 当前数量」的合并时段（ISO 字符串）。
-export function checkCapacity({ usage, capacityOf, overlapping, startMs, endMs }) {
+//   { mass, required, capacity, peak, deactivatedPeak,
+//     windows:[{start, end, used, deactivated}] }
+//   peak/used 仅统计预约占用（保持原字段含义），deactivatedPeak/deactivated 为停用量；
+//   windows 为「既有占用 + 停用 + 本次需求 > 当前数量」的合并时段（ISO 字符串，
+//   used/deactivated 取窗内峰值）。
+export function checkCapacity({ usage, capacityOf, overlapping, deactivations, startMs, endMs }) {
   const conflicts = [];
   for (const u of usage) {
     if (!(u.count > 0)) continue;
@@ -104,45 +160,65 @@ export function checkCapacity({ usage, capacityOf, overlapping, startMs, endMs }
         intervals.push({ startMs: r.startMs, endMs: r.endMs, count: ru.count });
       }
     }
-    const segments = occupancySegments(intervals, startMs, endMs);
+    const usedSegs = occupancySegments(intervals, startMs, endMs);
+    const deactSegs = occupancySegments(
+      deactivationIntervals(deactivations, u.mass),
+      startMs,
+      endMs,
+    );
+    const segments = mergeSegments(usedSegs, deactSegs, startMs, endMs);
     const peak = segments.reduce((m, seg) => Math.max(m, seg.used), 0);
-    if (peak + u.count <= capacity) continue;
+    const deactivatedPeak = segments.reduce((m, seg) => Math.max(m, seg.deactivated), 0);
 
-    // 超限时窗：used > capacity - required 的连续段（相邻合并，used 取段内峰值）
+    // 超限时窗：used + deactivated > capacity - required 的连续段
+    // （相邻合并，used/deactivated 各取段内峰值）
     const limit = capacity - u.count;
     const windows = [];
     for (const seg of segments) {
-      if (seg.used <= limit) continue;
+      if (seg.used + seg.deactivated <= limit) continue;
       const last = windows[windows.length - 1];
       if (last && last.endMs === seg.startMs) {
         last.endMs = seg.endMs;
         last.used = Math.max(last.used, seg.used);
+        last.deactivated = Math.max(last.deactivated, seg.deactivated);
       } else {
-        windows.push({ startMs: seg.startMs, endMs: seg.endMs, used: seg.used });
+        windows.push({
+          startMs: seg.startMs,
+          endMs: seg.endMs,
+          used: seg.used,
+          deactivated: seg.deactivated,
+        });
       }
     }
+    if (windows.length === 0) continue;
     conflicts.push({
       mass: u.mass,
       required: u.count,
       capacity,
       peak,
+      deactivatedPeak,
       windows: windows.map((w) => ({
         start: toIso(w.startMs),
         end: toIso(w.endMs),
         used: w.used,
+        deactivated: w.deactivated,
       })),
     });
   }
   return { ok: conflicts.length === 0, conflicts };
 }
 
-// ---------- 日程（展示已有占用及不足） ----------
+// ---------- 日程（展示已有占用、停用量及不足） ----------
 // reservations: 生效中预约 [{startMs, endMs, usage:[{mass,count}]}]
-// masses:       需要展示的规格集合（当前录入规格 ∪ 预约涉及规格）
+// deactivations: 生效中停用 [{startMs, endMs, mass, count}]（可缺省）
+// masses:       需要展示的规格集合（当前录入规格 ∪ 预约涉及规格 ∪ 停用涉及规格）
 // capacityOf:   (mass) => 当前录入可选数量
-// 返回 specs: [{mass, capacity, peak, shortage, segments:[{start,end,used,shortage}]}]
-// segments 仅保留 used>0 的区段；shortage 表示该时刻占用超过当前数量（不足）。
-export function buildSchedule({ reservations, masses, capacityOf, fromMs, toMs }) {
+// 返回 specs: [{mass, capacity, peak, shortage, deactivatedPeak, combinedShortage,
+//   segments:[{start, end, used, deactivated, shortage, combinedShortage}]}]
+// segments 仅保留 used>0 或 deactivated>0 的区段；
+// shortage 保持原含义：该时刻预约占用超过当前数量（不足）；
+// combinedShortage：该时刻「占用 + 停用」超过当前数量（占用加停用不足）。
+export function buildSchedule({ reservations, deactivations, masses, capacityOf, fromMs, toMs }) {
   const specs = [];
   for (const mass of masses) {
     const capacity = capacityOf(mass);
@@ -153,20 +229,32 @@ export function buildSchedule({ reservations, masses, capacityOf, fromMs, toMs }
         intervals.push({ startMs: r.startMs, endMs: r.endMs, count: ru.count });
       }
     }
-    const segments = occupancySegments(intervals, fromMs, toMs)
-      .filter((seg) => seg.used > 0)
+    const usedSegs = occupancySegments(intervals, fromMs, toMs);
+    const deactSegs = occupancySegments(
+      deactivationIntervals(deactivations, mass),
+      fromMs,
+      toMs,
+    );
+    const segments = mergeSegments(usedSegs, deactSegs, fromMs, toMs)
+      .filter((seg) => seg.used > 0 || seg.deactivated > 0)
       .map((seg) => ({
         start: toIso(seg.startMs),
         end: toIso(seg.endMs),
         used: seg.used,
+        deactivated: seg.deactivated,
         shortage: seg.used > capacity,
+        combinedShortage: seg.used + seg.deactivated > capacity,
       }));
     const peak = segments.reduce((m, seg) => Math.max(m, seg.used), 0);
+    const deactivatedPeak = segments.reduce((m, seg) => Math.max(m, seg.deactivated), 0);
+    const combinedPeak = segments.reduce((m, seg) => Math.max(m, seg.used + seg.deactivated), 0);
     specs.push({
       mass,
       capacity,
       peak,
       shortage: peak > capacity,
+      deactivatedPeak,
+      combinedShortage: combinedPeak > capacity,
       segments,
     });
   }
